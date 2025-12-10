@@ -7,6 +7,48 @@ params.threads   = params.threads   ?: 4
 
 
 /*
+ * Process: FASTP_QC
+ * QC only (we're not using trimmed reads yet).
+ * Input:  (sample_id, sample_dir)
+ * Output: sample_id.fastp.html, sample_id.fastp.json
+ */
+process FASTP_QC {
+
+    tag "${sample_id}"
+    publishDir "${params.outdir}/qc", mode: 'copy'
+
+    input:
+    tuple val(sample_id), path(sample_dir)
+
+    output:
+    path "${sample_id}.fastp.html"
+    path "${sample_id}.fastp.json"
+
+    script:
+    """
+    echo "Running fastp QC for sample: ${sample_id}"
+
+    R1=\$(ls ${sample_dir}/*_R1*.fastq.gz ${sample_dir}/*1.fastq.gz 2>/dev/null | head -n1)
+    R2=\$(ls ${sample_dir}/*_R2*.fastq.gz ${sample_dir}/*2.fastq.gz 2>/dev/null | head -n1)
+
+    if [ -z "\$R1" ] || [ -z "\$R2" ]; then
+        echo "Could not find R1/R2 FASTQs for ${sample_id} in ${sample_dir}" >&2
+        exit 1
+    fi
+
+    echo "R1: \$R1"
+    echo "R2: \$R2"
+
+    fastp \\
+      -i \$R1 -I \$R2 \\
+      -h ${sample_id}.fastp.html \\
+      -j ${sample_id}.fastp.json \\
+      -w ${params.threads}
+    """
+}
+
+
+/*
  * Process: ALIGN_READS
  * Input:  (sample_id, sample_dir, ref)
  * Output: (sample_id, sample_id.bam)
@@ -27,7 +69,6 @@ process ALIGN_READS {
     echo "Aligning sample: ${sample_id}"
     echo "Using reference: ${ref}"
 
-    # Try to find read pairs; adapt these patterns as needed.
     R1=\$(ls ${sample_dir}/*_R1*.fastq.gz ${sample_dir}/*1.fastq.gz 2>/dev/null | head -n1)
     R2=\$(ls ${sample_dir}/*_R2*.fastq.gz ${sample_dir}/*2.fastq.gz 2>/dev/null | head -n1)
 
@@ -39,7 +80,7 @@ process ALIGN_READS {
     echo "R1: \$R1"
     echo "R2: \$R2"
 
-    # Build BWA index for this reference in the work dir
+    # Build BWA index for this reference in the work dir (fine for tiny toy refs)
     bwa index ${ref}
 
     # Align and sort
@@ -52,11 +93,14 @@ process ALIGN_READS {
 
 
 /*
- * Process: COUNT_FROM_BAM
+ * Process: FEATURECOUNTS_PER_SAMPLE
  * Input:  (sample_id, bam)
  * Output: (sample_id, sample_id.counts.tsv)
+ *
+ * Runs featureCounts once per sample and extracts:
+ *   feature    count
  */
-process COUNT_FROM_BAM {
+process FEATURECOUNTS_PER_SAMPLE {
 
     tag "${sample_id}"
     publishDir "${params.outdir}/counts_per_sample", mode: 'copy'
@@ -69,10 +113,28 @@ process COUNT_FROM_BAM {
 
     script:
     """
-    echo "Counting reads for sample: ${sample_id}"
+    echo "Running featureCounts for sample: ${sample_id}"
+    echo "BAM: ${bam}"
 
-    samtools idxstats ${bam} \\
-      | awk 'BEGIN{OFS="\\t"} {print \$1, \$3}' \\
+    # Create a minimal SAF annotation in the work dir
+    cat > annotation.saf << 'EOF'
+GeneID\tChr\tStart\tEnd\tStrand
+gene1\tchr1\t1\t1000000\t+
+EOF
+
+    featureCounts \\
+      -T ${params.threads} \\
+      -p \\
+      -B \\
+      -F SAF \\
+      -a annotation.saf \\
+      -o ${sample_id}.raw_counts.txt \\
+      ${bam}
+
+    awk 'BEGIN{OFS="\\t"} \\
+         /^#/ {next} \\
+         NR==2 {next} \\
+         NR>2 {print \$1, \$7}' ${sample_id}.raw_counts.txt \\
       > ${sample_id}.counts.tsv
     """
 }
@@ -80,10 +142,10 @@ process COUNT_FROM_BAM {
 
 /*
  * Process: MERGE_COUNTS_MATRIX
- * Input:  list of count_files (Nextflow stages them all here)
+ * Input:  list of per-sample *.counts.tsv files
  * Output: counts_matrix.tsv
  *
- * Uses ONLY built-in Python, no pandas.
+ * Pure Python merge (no pandas).
  */
 process MERGE_COUNTS_MATRIX {
 
@@ -101,12 +163,10 @@ process MERGE_COUNTS_MATRIX {
 import glob
 import os
 
-# Find all staged count files
 files = sorted(glob.glob("*.counts.tsv"))
 if not files:
     raise SystemExit("No *.counts.tsv files found")
 
-# Load all counts into dictionaries
 all_counts = {}
 features = set()
 
@@ -121,7 +181,6 @@ for fname in files:
 
 features = sorted(list(features))
 
-# Write merged matrix
 with open("counts_matrix.tsv", "w") as out:
     header = ["feature"] + list(all_counts.keys())
     out.write("\\t".join(header) + "\\n")
@@ -163,28 +222,32 @@ workflow {
         .set { ref_ch }
 
     /*
+     * Run fastp QC per sample (independent)
+     */
+    samples_ch | FASTP_QC
+
+    /*
      * Combine samples with reference:
      *   (sample_id, sample_dir, ref)
      */
     samples_with_ref_ch = samples_ch.combine(ref_ch)
 
     /*
-     * 1) Align → (sample_id, bam)
+     * Align → (sample_id, bam)
      */
     aligned_ch = samples_with_ref_ch | ALIGN_READS
 
     /*
-     * 2) Count → (sample_id, sample_id.counts.tsv)
+     * featureCounts per sample → (sample_id, sample_id.counts.tsv)
      */
-    counts_ch  = aligned_ch | COUNT_FROM_BAM
+    counts_ch = aligned_ch | FEATURECOUNTS_PER_SAMPLE
 
     /*
-     * 3) Collect all count files into a single list channel
-     *    and feed to MERGE_COUNTS_MATRIX
+     * Collect all count files and feed to MERGE_COUNTS_MATRIX
      */
     counts_ch
-        .map { sid, f -> f }    // keep only the file path
-        .collect()              // list of paths, single emission
+        .map { sid, f -> f }
+        .collect()
         .set { counts_files_ch }
 
     counts_files_ch | MERGE_COUNTS_MATRIX
