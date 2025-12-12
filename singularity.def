@@ -1,0 +1,21 @@
+Bootstrap: docker
+From: jcap/rnaseq-pipeline:latest
+
+%labels
+    Author YourName
+    Description "Mini RNA-seq Nextflow pipeline image (fastp, bwa, samtools, featureCounts, python)"
+
+%environment
+    # Ensure the conda env binaries are on PATH at runtime
+    export PATH=/opt/conda/envs/rnaseq/bin:$PATH
+    export LC_ALL=C
+    export LANG=C
+
+%post
+    # Nothing to install here because we inherit everything from the Docker image.
+    # Keep this section minimal for fast builds.
+    echo "Singularity image built from docker://jcap/rnaseq-pipeline:latest"
+
+%runscript
+    # Default entrypoint
+    exec "$@"
