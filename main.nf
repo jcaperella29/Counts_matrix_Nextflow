@@ -2,16 +2,63 @@ nextflow.enable.dsl = 2
 
 params.input_dir = params.input_dir ?: 'data'
 params.outdir    = params.outdir    ?: 'results'
-params.ref       = params.ref       ?: 'ref.fa'   // reference genome
 params.threads   = params.threads   ?: 4
+params.ref       = params.ref ?: null
 
 
-/*
- * Process: FASTP_QC
- * QC only (we're not using trimmed reads yet).
- * Input:  (sample_id, sample_dir)
- * Output: sample_id.fastp.html, sample_id.fastp.json
- */
+
+process INDEX_REF {
+
+    tag "bwa_index"
+    publishDir "${params.outdir}/ref", mode: 'copy'
+
+    input:
+    path ref
+
+    output:
+    tuple path(ref),
+          path("${ref}.bwt"),
+          path("${ref}.sa"),
+          path("${ref}.ann"),
+          path("${ref}.amb"),
+          path("${ref}.pac")
+
+    script:
+    """
+    echo "Checking BWA index for ${ref}"
+
+    if [ ! -f "${ref}.bwt" ]; then
+        echo "BWA index not found — building index"
+        bwa index ${ref}
+    else
+        echo "BWA index already exists — skipping"
+    fi
+    """
+}
+/* -------------------------------------------------------------------------- */
+/* MAKE_REF – generate a minimal reference FASTA for toy/testing runs          */
+/* -------------------------------------------------------------------------- */
+process MAKE_REF {
+
+    tag "ref"
+    publishDir "${params.outdir}/ref", mode: 'copy'
+
+    output:
+    path "ref.fa"
+
+    script:
+    """
+    cat > ref.fa << 'EOF'
+>chr1
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+EOF
+    """
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* FASTP_QC – per-sample fastp QC                                             */
+/* -------------------------------------------------------------------------- */
 process FASTP_QC {
 
     tag "${sample_id}"
@@ -32,12 +79,9 @@ process FASTP_QC {
     R2=\$(ls ${sample_dir}/*_R2*.fastq.gz ${sample_dir}/*2.fastq.gz 2>/dev/null | head -n1)
 
     if [ -z "\$R1" ] || [ -z "\$R2" ]; then
-        echo "Could not find R1/R2 FASTQs for ${sample_id} in ${sample_dir}" >&2
+        echo "ERROR: Could not find R1/R2 FASTQs for ${sample_id}" >&2
         exit 1
     fi
-
-    echo "R1: \$R1"
-    echo "R2: \$R2"
 
     fastp \\
       -i \$R1 -I \$R2 \\
@@ -48,11 +92,9 @@ process FASTP_QC {
 }
 
 
-/*
- * Process: ALIGN_READS
- * Input:  (sample_id, sample_dir, ref)
- * Output: (sample_id, sample_id.bam)
- */
+/* -------------------------------------------------------------------------- */
+/* ALIGN_READS – BWA paired-end alignment + sorting + BAM index               */
+/* -------------------------------------------------------------------------- */
 process ALIGN_READS {
 
     tag "${sample_id}"
@@ -73,14 +115,14 @@ process ALIGN_READS {
     R2=\$(ls ${sample_dir}/*_R2*.fastq.gz ${sample_dir}/*2.fastq.gz 2>/dev/null | head -n1)
 
     if [ -z "\$R1" ] || [ -z "\$R2" ]; then
-        echo "Could not find R1/R2 FASTQs for ${sample_id} in ${sample_dir}" >&2
+        echo "ERROR: Missing FASTQs for ${sample_id}" >&2
         exit 1
     fi
 
     echo "R1: \$R1"
     echo "R2: \$R2"
 
-    # Build BWA index for this reference in the work dir (fine for tiny toy refs)
+    # Build BWA index in task work dir (toy pipeline)
     bwa index ${ref}
 
     # Align and sort
@@ -92,14 +134,9 @@ process ALIGN_READS {
 }
 
 
-/*
- * Process: FEATURECOUNTS_PER_SAMPLE
- * Input:  (sample_id, bam)
- * Output: (sample_id, sample_id.counts.tsv)
- *
- * Runs featureCounts once per sample and extracts:
- *   feature    count
- */
+/* -------------------------------------------------------------------------- */
+/* FEATURECOUNTS_PER_SAMPLE – paired-end featureCounts with auto-SAF          */
+/* -------------------------------------------------------------------------- */
 process FEATURECOUNTS_PER_SAMPLE {
 
     tag "${sample_id}"
@@ -116,7 +153,7 @@ process FEATURECOUNTS_PER_SAMPLE {
     echo "Running featureCounts for sample: ${sample_id}"
     echo "BAM: ${bam}"
 
-    # Create a minimal SAF annotation in the work dir
+    # Minimal SAF annotation for toy reference
     cat > annotation.saf << 'EOF'
 GeneID\tChr\tStart\tEnd\tStrand
 gene1\tchr1\t1\t1000000\t+
@@ -131,6 +168,7 @@ EOF
       -o ${sample_id}.raw_counts.txt \\
       ${bam}
 
+    # Extract (feature, count) into sample_X.counts.tsv
     awk 'BEGIN{OFS="\\t"} \\
          /^#/ {next} \\
          NR==2 {next} \\
@@ -140,13 +178,9 @@ EOF
 }
 
 
-/*
- * Process: MERGE_COUNTS_MATRIX
- * Input:  list of per-sample *.counts.tsv files
- * Output: counts_matrix.tsv
- *
- * Pure Python merge (no pandas).
- */
+/* -------------------------------------------------------------------------- */
+/* MERGE_COUNTS_MATRIX – merge sample-level TSVs into one matrix              */
+/* -------------------------------------------------------------------------- */
 process MERGE_COUNTS_MATRIX {
 
     publishDir "${params.outdir}", mode: 'copy'
@@ -165,7 +199,7 @@ import os
 
 files = sorted(glob.glob("*.counts.tsv"))
 if not files:
-    raise SystemExit("No *.counts.tsv files found")
+    raise SystemExit("No count files found.")
 
 all_counts = {}
 features = set()
@@ -173,78 +207,62 @@ features = set()
 for fname in files:
     sid = os.path.basename(fname).split(".")[0]
     all_counts[sid] = {}
-    with open(fname) as fh:
-        for line in fh:
+    with open(fname) as f:
+        for line in f:
             feat, count = line.strip().split("\\t")
             all_counts[sid][feat] = count
             features.add(feat)
 
-features = sorted(list(features))
+features = sorted(features)
 
 with open("counts_matrix.tsv", "w") as out:
-    header = ["feature"] + list(all_counts.keys())
-    out.write("\\t".join(header) + "\\n")
-
+    out.write("feature\\t" + "\\t".join(all_counts.keys()) + "\\n")
     for feat in features:
-        row = [feat]
-        for sid in all_counts.keys():
-            row.append(all_counts[sid].get(feat, "0"))
+        row = [feat] + [all_counts[sid].get(feat, "0") for sid in all_counts]
         out.write("\\t".join(row) + "\\n")
 EOF
     """
 }
 
 
-/*
- * Main workflow
- */
+/* -------------------------------------------------------------------------- */
 workflow {
 
-    // Ensure output directory exists
     file(params.outdir).mkdirs()
 
-    /*
-     * Channel of samples:
-     *   (sample_id, sample_dir)
-     */
+    // Decide reference source (toy by default, user can override with --ref)
+    if (params.ref) {
+        log.info "Using user-provided reference: ${params.ref}"
+        raw_ref_ch = Channel.fromPath(params.ref, checkIfExists: true)
+    } else {
+        log.info "No reference provided -- using toy reference"
+        raw_ref_ch = MAKE_REF()
+    }
+
+    // Build BWA index if missing (runs once per resume-able execution)
+    indexed_ref_ch = raw_ref_ch | INDEX_REF
+
+    // We only need to pass the ref fasta path into ALIGN_READS
+    ref_only_ch = indexed_ref_ch.map { ref, bwt, sa, ann, amb, pac -> ref }
+
+    // sample dirs: (sample_id, sample_dir)
     Channel
         .fromPath("${params.input_dir}/*", type: 'dir')
-        .map { dir ->
-            tuple(dir.baseName, dir)
-        }
+        .map { dir -> tuple(dir.baseName, dir) }
         .set { samples_ch }
 
-    /*
-     * Single-value channel with the reference FASTA
-     */
-    Channel
-        .value( file(params.ref) )
-        .set { ref_ch }
-
-    /*
-     * Run fastp QC per sample (independent)
-     */
+    // QC (branch)
     samples_ch | FASTP_QC
 
-    /*
-     * Combine samples with reference:
-     *   (sample_id, sample_dir, ref)
-     */
-    samples_with_ref_ch = samples_ch.combine(ref_ch)
+    // Align
+    aligned_ch = samples_ch
+        .combine(ref_only_ch)
+        | ALIGN_READS
 
-    /*
-     * Align → (sample_id, bam)
-     */
-    aligned_ch = samples_with_ref_ch | ALIGN_READS
-
-    /*
-     * featureCounts per sample → (sample_id, sample_id.counts.tsv)
-     */
+    // Count per sample
     counts_ch = aligned_ch | FEATURECOUNTS_PER_SAMPLE
 
-    /*
-     * Collect all count files and feed to MERGE_COUNTS_MATRIX
-     */
+    // Merge counts matrix
     counts_ch
         .map { sid, f -> f }
         .collect()
@@ -252,3 +270,4 @@ workflow {
 
     counts_files_ch | MERGE_COUNTS_MATRIX
 }
+
