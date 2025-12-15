@@ -1,42 +1,47 @@
 nextflow.enable.dsl = 2
 
-params.input_dir = params.input_dir ?: 'data'
-params.outdir    = params.outdir    ?: 'results'
-params.threads   = params.threads   ?: 4
-params.ref       = params.ref ?: null
+/*
+  Portfolio-ready mini RNA-seq pipeline
+  - QC: fastp
+  - Genome alignment (for tracks + gene counts): STAR -> sorted BAM
+  - Tracks: BigWig (deeptools bamCoverage)
+  - Gene counts: featureCounts (GTF)
+  - Transcript quant: Salmon
+  - Summary: MultiQC
 
+  Required tools in container:
+    fastp, star, samtools, subread(featureCounts), salmon, multiqc, deeptools
 
+  Inputs (recommended): samplesheet.csv with columns: sample,read1,read2
+*/
 
-process INDEX_REF {
+params.samplesheet = params.samplesheet ?: null
+params.input_dir   = params.input_dir   ?: 'data'     // fallback if no samplesheet
+params.outdir      = params.outdir      ?: 'results'
+params.threads     = params.threads     ?: 4
 
-    tag "bwa_index"
-    publishDir "${params.outdir}/ref", mode: 'copy'
+// Reference inputs
+params.ref         = params.ref         ?: null        // genome FASTA
+params.gtf         = params.gtf         ?: null        // annotation GTF for featureCounts
+params.transcripts = params.transcripts ?: null        // transcriptome FASTA for Salmon
 
-    input:
-    path ref
+// Track settings
+params.bw_binsize  = params.bw_binsize  ?: 10
+params.bw_norm     = params.bw_norm     ?: 'CPM'       // CPM is a reasonable default
 
-    output:
-    tuple path(ref),
-          path("${ref}.bwt"),
-          path("${ref}.sa"),
-          path("${ref}.ann"),
-          path("${ref}.amb"),
-          path("${ref}.pac")
+/* -------------------------------------------------------------------------- */
+/* Helpers                                                                    */
+/* -------------------------------------------------------------------------- */
 
-    script:
-    """
-    echo "Checking BWA index for ${ref}"
-
-    if [ ! -f "${ref}.bwt" ]; then
-        echo "BWA index not found — building index"
-        bwa index ${ref}
-    else
-        echo "BWA index already exists — skipping"
-    fi
-    """
+def require_param(name, value) {
+    if (!value) {
+        throw new IllegalArgumentException("Missing required parameter --${name}")
+    }
 }
+
 /* -------------------------------------------------------------------------- */
 /* MAKE_REF – generate a minimal reference FASTA for toy/testing runs          */
+/* (kept for completeness; real runs should provide --ref/--gtf/--transcripts) */
 /* -------------------------------------------------------------------------- */
 process MAKE_REF {
 
@@ -55,87 +60,127 @@ EOF
     """
 }
 
-
 /* -------------------------------------------------------------------------- */
 /* FASTP_QC – per-sample fastp QC                                             */
 /* -------------------------------------------------------------------------- */
 process FASTP_QC {
 
     tag "${sample_id}"
-    publishDir "${params.outdir}/qc", mode: 'copy'
+    publishDir "${params.outdir}/qc/fastp", mode: 'copy'
 
     input:
-    tuple val(sample_id), path(sample_dir)
+    tuple val(sample_id), path(r1), path(r2)
 
     output:
-    path "${sample_id}.fastp.html"
-    path "${sample_id}.fastp.json"
+    tuple val(sample_id),
+          path("${sample_id}_R1.trim.fastq.gz"),
+          path("${sample_id}_R2.trim.fastq.gz"),
+          path("${sample_id}.fastp.html"),
+          path("${sample_id}.fastp.json")
 
     script:
     """
-    echo "Running fastp QC for sample: ${sample_id}"
-
-    R1=\$(ls ${sample_dir}/*_R1*.fastq.gz ${sample_dir}/*1.fastq.gz 2>/dev/null | head -n1)
-    R2=\$(ls ${sample_dir}/*_R2*.fastq.gz ${sample_dir}/*2.fastq.gz 2>/dev/null | head -n1)
-
-    if [ -z "\$R1" ] || [ -z "\$R2" ]; then
-        echo "ERROR: Could not find R1/R2 FASTQs for ${sample_id}" >&2
-        exit 1
-    fi
+    echo "Running fastp for: ${sample_id}"
 
     fastp \\
-      -i \$R1 -I \$R2 \\
+      -i ${r1} -I ${r2} \\
+      -o ${sample_id}_R1.trim.fastq.gz \\
+      -O ${sample_id}_R2.trim.fastq.gz \\
       -h ${sample_id}.fastp.html \\
       -j ${sample_id}.fastp.json \\
       -w ${params.threads}
     """
 }
 
+/* -------------------------------------------------------------------------- */
+/* STAR_INDEX – build STAR genome index                                       */
+/* -------------------------------------------------------------------------- */
+process STAR_INDEX {
+
+    tag "star_index"
+    publishDir "${params.outdir}/ref/star", mode: 'copy'
+
+    input:
+    path ref
+
+    output:
+    path "STAR_INDEX"
+
+    script:
+    """
+    mkdir -p STAR_INDEX
+    STAR \\
+      --runThreadN ${params.threads} \\
+      --runMode genomeGenerate \\
+      --genomeDir STAR_INDEX \\
+      --genomeFastaFiles ${ref}
+    """
+}
 
 /* -------------------------------------------------------------------------- */
-/* ALIGN_READS – BWA paired-end alignment + sorting + BAM index               */
+/* STAR_ALIGN – align paired-end reads, output coordinate-sorted BAM          */
 /* -------------------------------------------------------------------------- */
-process ALIGN_READS {
+process STAR_ALIGN {
 
     tag "${sample_id}"
     publishDir "${params.outdir}/bam", mode: 'copy'
 
     input:
-    tuple val(sample_id), path(sample_dir), path(ref)
+    tuple val(sample_id), path(r1), path(r2), path(star_index_dir)
 
     output:
     tuple val(sample_id), path("${sample_id}.bam")
 
     script:
     """
-    echo "Aligning sample: ${sample_id}"
-    echo "Using reference: ${ref}"
+    echo "STAR aligning: ${sample_id}"
 
-    R1=\$(ls ${sample_dir}/*_R1*.fastq.gz ${sample_dir}/*1.fastq.gz 2>/dev/null | head -n1)
-    R2=\$(ls ${sample_dir}/*_R2*.fastq.gz ${sample_dir}/*2.fastq.gz 2>/dev/null | head -n1)
+    STAR \\
+      --runThreadN ${params.threads} \\
+      --genomeDir ${star_index_dir} \\
+      --readFilesIn ${r1} ${r2} \\
+      --readFilesCommand zcat \\
+      --outSAMtype BAM SortedByCoordinate \\
+      --outFileNamePrefix ${sample_id}.
 
-    if [ -z "\$R1" ] || [ -z "\$R2" ]; then
-        echo "ERROR: Missing FASTQs for ${sample_id}" >&2
-        exit 1
-    fi
-
-    echo "R1: \$R1"
-    echo "R2: \$R2"
-
-    # Build BWA index in task work dir (toy pipeline)
-    bwa index ${ref}
-
-    # Align and sort
-    bwa mem -t ${params.threads} ${ref} \$R1 \$R2 \\
-      | samtools sort -@ ${params.threads} -o ${sample_id}.bam
-
+    # STAR writes: <prefix>Aligned.sortedByCoord.out.bam
+    mv ${sample_id}.Aligned.sortedByCoord.out.bam ${sample_id}.bam
     samtools index ${sample_id}.bam
+
+    # Basic mapping stats for MultiQC
+    samtools flagstat ${sample_id}.bam > ${sample_id}.flagstat.txt
     """
 }
 
+/* -------------------------------------------------------------------------- */
+/* BAM_TO_BIGWIG – genome browser tracks via deeptools bamCoverage            */
+/* -------------------------------------------------------------------------- */
+process BAM_TO_BIGWIG {
+
+    tag "${sample_id}"
+    publishDir "${params.outdir}/tracks", mode: 'copy'
+
+    input:
+    tuple val(sample_id), path(bam)
+
+    output:
+    tuple val(sample_id), path("${sample_id}.bw")
+
+    script:
+    """
+    echo "Creating BigWig track for: ${sample_id}"
+
+    bamCoverage \\
+      -b ${bam} \\
+      -o ${sample_id}.bw \\
+      --binSize ${params.bw_binsize} \\
+      --normalizeUsing ${params.bw_norm} \\
+      -p ${params.threads}
+    """
+}
 
 /* -------------------------------------------------------------------------- */
-/* FEATURECOUNTS_PER_SAMPLE – paired-end featureCounts with auto-SAF          */
+/* FEATURECOUNTS_PER_SAMPLE – gene-level counts from STAR BAM                 */
 /* -------------------------------------------------------------------------- */
 process FEATURECOUNTS_PER_SAMPLE {
 
@@ -143,43 +188,37 @@ process FEATURECOUNTS_PER_SAMPLE {
     publishDir "${params.outdir}/counts_per_sample", mode: 'copy'
 
     input:
-    tuple val(sample_id), path(bam)
+    tuple val(sample_id), path(bam), path(gtf)
 
     output:
-    tuple val(sample_id), path("${sample_id}.counts.tsv")
+    tuple val(sample_id), path("${sample_id}.counts.tsv"), path("${sample_id}.featureCounts.summary")
 
     script:
     """
-    echo "Running featureCounts for sample: ${sample_id}"
-    echo "BAM: ${bam}"
-
-    # Minimal SAF annotation for toy reference
-    cat > annotation.saf << 'EOF'
-GeneID\tChr\tStart\tEnd\tStrand
-gene1\tchr1\t1\t1000000\t+
-EOF
+    echo "Running featureCounts for: ${sample_id}"
 
     featureCounts \\
       -T ${params.threads} \\
       -p \\
       -B \\
-      -F SAF \\
-      -a annotation.saf \\
+      -a ${gtf} \\
       -o ${sample_id}.raw_counts.txt \\
       ${bam}
 
-    # Extract (feature, count) into sample_X.counts.tsv
-    awk 'BEGIN{OFS="\\t"} \\
+    # Keep the summary too (MultiQC can parse it)
+    cp ${sample_id}.raw_counts.txt.summary ${sample_id}.featureCounts.summary
+
+    # Extract (feature, count)
+    awk 'BEGIN{OFS="\t"} \\
          /^#/ {next} \\
          NR==2 {next} \\
-         NR>2 {print \$1, \$7}' ${sample_id}.raw_counts.txt \\
+         NR>2 {print $1, $7}' ${sample_id}.raw_counts.txt \\
       > ${sample_id}.counts.tsv
     """
 }
 
-
 /* -------------------------------------------------------------------------- */
-/* MERGE_COUNTS_MATRIX – merge sample-level TSVs into one matrix              */
+/* MERGE_COUNTS_MATRIX – merge sample gene count TSVs                         */
 /* -------------------------------------------------------------------------- */
 process MERGE_COUNTS_MATRIX {
 
@@ -209,65 +248,230 @@ for fname in files:
     all_counts[sid] = {}
     with open(fname) as f:
         for line in f:
-            feat, count = line.strip().split("\\t")
+            feat, count = line.strip().split("\t")
             all_counts[sid][feat] = count
             features.add(feat)
 
 features = sorted(features)
 
 with open("counts_matrix.tsv", "w") as out:
-    out.write("feature\\t" + "\\t".join(all_counts.keys()) + "\\n")
+    out.write("feature\t" + "\t".join(all_counts.keys()) + "\n")
     for feat in features:
         row = [feat] + [all_counts[sid].get(feat, "0") for sid in all_counts]
-        out.write("\\t".join(row) + "\\n")
+        out.write("\t".join(row) + "\n")
 EOF
     """
 }
 
+/* -------------------------------------------------------------------------- */
+/* SALMON_INDEX – build Salmon transcriptome index                            */
+/* -------------------------------------------------------------------------- */
+process SALMON_INDEX {
+
+    tag "salmon_index"
+    publishDir "${params.outdir}/ref/salmon", mode: 'copy'
+
+    input:
+    path transcripts
+
+    output:
+    path "SALMON_INDEX"
+
+    script:
+    """
+    mkdir -p SALMON_INDEX
+    salmon index \\
+      -t ${transcripts} \\
+      -i SALMON_INDEX \\
+      -p ${params.threads}
+    """
+}
+
+/* -------------------------------------------------------------------------- */
+/* SALMON_QUANT – per-sample Salmon quant                                     */
+/* -------------------------------------------------------------------------- */
+process SALMON_QUANT {
+
+    tag "${sample_id}"
+    publishDir "${params.outdir}/salmon/${sample_id}", mode: 'copy'
+
+    input:
+    tuple val(sample_id), path(r1), path(r2), path(salmon_index)
+
+    output:
+    tuple val(sample_id), path("quant.sf")
+
+    script:
+    """
+    echo "Salmon quant for: ${sample_id}"
+
+    salmon quant \\
+      -i ${salmon_index} \\
+      -l A \\
+      -1 ${r1} -2 ${r2} \\
+      -p ${params.threads} \\
+      --validateMappings \\
+      -o .
+
+    # keep a stable filename for downstream merge
+    cp quant.sf quant.sf
+    """
+}
+
+/* -------------------------------------------------------------------------- */
+/* MERGE_SALMON_TPM – merge Salmon quant.sf into TPM matrix                   */
+/* -------------------------------------------------------------------------- */
+process MERGE_SALMON_TPM {
+
+    publishDir "${params.outdir}", mode: 'copy'
+
+    input:
+    tuple val(sample_id), path(qsf)
+
+    output:
+    path "salmon_tpm_matrix.tsv"
+
+    script:
+    """
+    python << 'EOF'
+import os
+import glob
+
+# Expect files placed in workdir with names like <sample>.quant.sf via staging
+qfiles = sorted(glob.glob("*.quant.sf"))
+if not qfiles:
+    raise SystemExit("No *.quant.sf files found for merging")
+
+samples = []
+rows = {}  # tx -> {sample: tpm}
+
+for q in qfiles:
+    sample = os.path.basename(q).replace(".quant.sf", "")
+    samples.append(sample)
+    with open(q) as f:
+        header = f.readline().strip().split("\t")
+        # Name Length EffectiveLength TPM NumReads
+        idx_name = header.index("Name")
+        idx_tpm  = header.index("TPM")
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            tx = parts[idx_name]
+            tpm = parts[idx_tpm]
+            rows.setdefault(tx, {})[sample] = tpm
+
+samples = sorted(samples)
+
+with open("salmon_tpm_matrix.tsv", "w") as out:
+    out.write("transcript\t" + "\t".join(samples) + "\n")
+    for tx in sorted(rows.keys()):
+        out.write(tx)
+        for s in samples:
+            out.write("\t" + rows[tx].get(s, "0"))
+        out.write("\n")
+EOF
+    """
+}
+
+/* -------------------------------------------------------------------------- */
+/* MULTIQC – aggregate QC/alignment/counting reports                          */
+/* -------------------------------------------------------------------------- */
+process MULTIQC {
+
+    publishDir "${params.outdir}/qc", mode: 'copy'
+
+    input:
+    path(qc_dir)
+
+    output:
+    path "multiqc_report.html"
+
+    script:
+    """
+    multiqc ${qc_dir} -o .
+    """
+}
 
 /* -------------------------------------------------------------------------- */
 workflow {
 
     file(params.outdir).mkdirs()
 
-    // Decide reference source (toy by default, user can override with --ref)
-    if (params.ref) {
-        log.info "Using user-provided reference: ${params.ref}"
-        raw_ref_ch = Channel.fromPath(params.ref, checkIfExists: true)
-    } else {
-        log.info "No reference provided -- using toy reference"
-        raw_ref_ch = MAKE_REF()
-    }
+    /* --------------------------- Parameter checks -------------------------- */
+    // For "real" runs, enforce these. (You can comment these out for toy demos.)
+    require_param('samplesheet', params.samplesheet)
+    require_param('ref', params.ref)
+    require_param('gtf', params.gtf)
+    require_param('transcripts', params.transcripts)
 
-    // Build BWA index if missing (runs once per resume-able execution)
-    indexed_ref_ch = raw_ref_ch | INDEX_REF
+    /* ------------------------------- Reference ----------------------------- */
+    ref_ch = Channel.fromPath(params.ref, checkIfExists: true)
+    gtf_ch = Channel.fromPath(params.gtf, checkIfExists: true)
+    tx_ch  = Channel.fromPath(params.transcripts, checkIfExists: true)
 
-    // We only need to pass the ref fasta path into ALIGN_READS
-    ref_only_ch = indexed_ref_ch.map { ref, bwt, sa, ann, amb, pac -> ref }
+    star_index_ch   = ref_ch | STAR_INDEX
+    salmon_index_ch = tx_ch  | SALMON_INDEX
 
-    // sample dirs: (sample_id, sample_dir)
-    Channel
-        .fromPath("${params.input_dir}/*", type: 'dir')
-        .map { dir -> tuple(dir.baseName, dir) }
-        .set { samples_ch }
+    /* ------------------------------- Samples ------------------------------- */
+    // Prefer samplesheet.csv: sample,read1,read2
+    samples_ch = Channel
+        .fromPath(params.samplesheet, checkIfExists: true)
+        .splitCsv(header:true)
+        .map { row ->
+            def sid = row.sample as String
+            tuple(sid,
+                  file(row.read1 as String),
+                  file(row.read2 as String))
+        }
 
-    // QC (branch)
-    samples_ch | FASTP_QC
+    /* ------------------------------ fastp QC ------------------------------- */
+    fastp_out_ch = samples_ch | FASTP_QC
 
-    // Align
-    aligned_ch = samples_ch
-        .combine(ref_only_ch)
-        | ALIGN_READS
+    // Split trimmed reads back out
+    trimmed_reads_ch = fastp_out_ch.map { sid, r1t, r2t, html, json -> tuple(sid, r1t, r2t) }
 
-    // Count per sample
-    counts_ch = aligned_ch | FEATURECOUNTS_PER_SAMPLE
+    /* --------------------------- STAR for tracks --------------------------- */
+    aligned_ch = trimmed_reads_ch
+        .combine(star_index_ch)
+        .map { s_tup, idx -> tuple(s_tup[0], s_tup[1], s_tup[2], idx) }
+        | STAR_ALIGN
 
-    // Merge counts matrix
-    counts_ch
-        .map { sid, f -> f }
+    // Tracks
+    aligned_ch | BAM_TO_BIGWIG
+
+    /* ------------------------ featureCounts gene counts -------------------- */
+    counts_ch = aligned_ch
+        .combine(gtf_ch)
+        .map { bam_tup, gtf -> tuple(bam_tup[0], bam_tup[1], gtf) }
+        | FEATURECOUNTS_PER_SAMPLE
+
+    counts_files_ch = counts_ch
+        .map { sid, tsv, summary -> tsv }
         .collect()
-        .set { counts_files_ch }
 
     counts_files_ch | MERGE_COUNTS_MATRIX
+
+    /* ------------------------------ Salmon quant --------------------------- */
+    salmon_q_ch = trimmed_reads_ch
+        .combine(salmon_index_ch)
+        .map { s_tup, sidx -> tuple(s_tup[0], s_tup[1], s_tup[2], sidx) }
+        | SALMON_QUANT
+
+    // Stage quant.sf files as <sample>.quant.sf for merging
+    salmon_q_ch
+        .map { sid, qsf ->
+            def staged = file("${sid}.quant.sf")
+            staged.text = qsf.text
+            staged
+        }
+        .collect()
+        .set { staged_quant_files_ch }
+
+    // Merge TPM matrix
+    staged_quant_files_ch | MERGE_SALMON_TPM
+
+    /* ------------------------------ MultiQC -------------------------------- */
+    // Point MultiQC at the whole results directory (safe + simple)
+    Channel.fromPath(params.outdir, type:'dir') | MULTIQC
 }
+
 
