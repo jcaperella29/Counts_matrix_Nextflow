@@ -1,20 +1,40 @@
 Counts_matrix_Nextflow
 
-A minimal, portable Nextflow DSL2 RNA-seq pipeline that:
+A portable Nextflow DSL2 RNA-seq pipeline that performs:
 
-Accepts paired-end FASTQs
+QC
 
-Performs QC → alignment → counting → matrix merge
+Genome alignment
 
-Works with Conda, Docker, or Singularity
+Gene-level counting
 
-Uses a toy reference FASTA by default
+Transcript-level quantification
 
-Automatically builds BWA indexes if missing
+Coverage track generation
 
-Allows users to provide their own reference genome
+Matrix merging and summary reporting
 
-This is intentionally lightweight and ideal for:
+Designed to be minimal, readable, and robust, while still demonstrating real RNA-seq best practices.
+
+Features
+
+This pipeline:
+
+Accepts paired-end FASTQs via a samplesheet
+
+Performs QC → alignment → quantification → matrix merge
+
+Generates gene counts, TPM matrices, and BigWig tracks
+
+Automatically builds STAR and Salmon indexes
+
+Skips coverage generation gracefully for samples with zero mapped reads
+
+Works with Conda, Docker, or Singularity/Apptainer
+
+Uses standard, well-documented tools
+
+Ideal for:
 
 Teaching / demos
 
@@ -22,137 +42,156 @@ Testing infrastructure
 
 Prototyping larger RNA-seq workflows
 
+Portfolio or template pipelines
+
 Pipeline Overview
+Steps
 
-Steps:
+FASTQ QC & trimming
 
-(Optional) Generate toy reference FASTA (MAKE_REF)
+fastp
 
-Build BWA index if missing (INDEX_REF)
+Genome index build (once per run)
 
-Paired-end QC with fastp
+STAR --runMode genomeGenerate
 
-Paired-end alignment with BWA MEM
+Genome alignment
 
-Sorting & indexing with samtools
+STAR → coordinate-sorted BAM
 
-Counting with featureCounts (SAF mode)
+BAM indexing + flagstat
 
-Merge per-sample counts into a matrix
+Coverage tracks
+
+deepTools bamCoverage → BigWig
+
+Automatically skipped if no mapped reads
+
+Gene-level counting
+
+featureCounts (GTF-based)
+
+Transcript-level quantification
+
+Salmon quant
+
+Matrix merging
+
+Gene count matrix (counts_matrix.tsv)
+
+Transcript TPM matrix (salmon_tpm_matrix.tsv)
+
+Summary reporting
+
+MultiQC
+
+Input Format
+Samplesheet (CSV)
+sample,read1,read2
+S1,data/S1_R1.fastq.gz,data/S1_R2.fastq.gz
+S2,data/S2_R1.fastq.gz,data/S2_R2.fastq.gz
 
 
-data/
-├── sample_1/
-│   ├── sample_1_R1.fastq.gz
-│   └── sample_1_R2.fastq.gz
-└── sample_2/
-    ├── sample_2_R1.fastq.gz
-    └── sample_2_R2.fastq.gz
+Required columns:
 
-Supported FASTQ name patterns:
-Supported FASTQ name patterns:
+sample
 
-*_R1*.fastq.gz / *_R2*.fastq.gz
+read1
 
-*1.fastq.gz / *2.fastq.gz
+read2
 
-Outputs
+Required Inputs
+
+Reference genome FASTA (--ref)
+
+Gene annotation GTF (--gtf)
+
+Transcript FASTA for Salmon (--transcripts)
+
+Samplesheet CSV (--samplesheet)
+
+Output Structure
 results/
-├── ref/
-│   ├── ref.fa
-│   └── ref.fa.*        # BWA index files
 ├── qc/
-│   ├── sample_1.fastp.html
-│   └── sample_1.fastp.json
+│   ├── S1.fastp.html
+│   └── S1.fastp.json
+├── ref/
+│   ├── star/
+│   │   └── STAR_INDEX/
+│   └── salmon/
+│       └── SALMON_INDEX/
 ├── bam/
-│   ├── sample_1.bam
-│   └── sample_1.bam.bai
+│   ├── S1.bam
+│   ├── S1.bam.bai
+│   └── S1.flagstat.txt
+├── bigwig/
+│   └── S1.bw
 ├── counts_per_sample/
-│   ├── sample_1.counts.tsv
-│   └── sample_2.counts.tsv
-└── counts_matrix.tsv
+│   ├── S1.counts.tsv
+│   └── S2.counts.tsv
+├── counts_matrix.tsv
+├── salmon_tpm_matrix.tsv
+└── multiqc_report.html
 
+Deployment options (all code is bash)
+ to run  with Docker
+ docker build -t rnaseq-pipeline .
+nextflow run main.nf -profile docker \
+  --samplesheet samples.csv \
+  --ref genome.fa \
+  --gtf genes.gtf \
+  --transcripts transcripts.fa
 
-Running the Pipeline(all the code is in bash)
-1️⃣ Conda (recommended for local dev)
-conda activate nf_genomics
-nextflow run main.nf -profile conda
+to run with Apptainer
 
-
-2️⃣ Docker
-
-Make sure Docker is running and the image exists locally:
-
-docker build -t rnaseq-pipeline .
-nextflow run main.nf -profile docker
-
-3️⃣ Singularity / Apptainer (HPC-friendly)
-
-sudo singularity build containers/rnaseq-pipeline.sif docker-archive://containers/rnaseq-pipeline.tar
-nextflow run main.nf -profile singularity
-
-Using Your Own Reference Genome
-
-By default, the pipeline generates a toy FASTA (ref.fa).
-
-To use a real reference:
-
-nextflow run main.nf \
-  -profile conda \
-  --ref path/to/genome.fa
-
-BWA index files will be created automatically if missing
-
-Existing indexes will be reused
-
-
+singularity build containers/rnaseq-pipeline.sif docker://rnaseq-pipeline
+nextflow run main.nf -profile singularity \
+  --samplesheet samples.csv \
+  --ref genome.fa \
+  --gtf genes.gtf \
+  --transcripts transcripts.fa
 Parameters
+| Parameter       | Default      | Description                   |
+| --------------- | ------------ | ----------------------------- |
+| `--samplesheet` | *(required)* | CSV mapping samples to FASTQs |
+| `--ref`         | *(required)* | Reference genome FASTA        |
+| `--gtf`         | *(required)* | Gene annotation GTF           |
+| `--transcripts` | *(required)* | Transcript FASTA for Salmon   |
+| `--outdir`      | `results`    | Output directory              |
+| `--threads`     | `4`          | Threads per task              |
+| `--bw_binsize`  | `10`         | BigWig bin size               |
+| `--bw_norm`     | `CPM`        | BigWig normalization          |
 
-| Parameter     | Default   | Description              |
-| ------------- | --------- | ------------------------ |
-| `--input_dir` | `data`    | Sample directories       |
-| `--outdir`    | `results` | Output directory         |
-| `--threads`   | `4`       | Threads per task         |
-| `--ref`       | *(none)*  | Optional reference FASTA |
-
-
-
-Profiles Summary
-
-
-| Profile       | Use case                |
-| ------------- | ----------------------- |
-| `conda`       | Local development       |
-| `docker`      | Reproducible containers |
-| `singularity` | HPC clusters            |
-
-Configured in nextflow.config.
-
-equirements
+Requirements
 
 Nextflow ≥ 23
 
-One of:
-
-Conda
-
-Docker
-
+Docker 
 Singularity / Apptainer
+fastp
+STAR
+samtools
+subread (featureCounts)
+salmon
+deeptools
+multiqc
+otes & Design Philosophy
 
-Notes & Design Philosophy
+Intentionally simple and readable
 
-This pipeline is intentionally simple
+Avoids over-engineering
 
-SAF annotation is generated automatically for toy refs
+Uses explicit channels instead of heavy abstraction
 
-FeatureCounts is run in paired-end mode
+Guards against common RNA-seq failure modes (e.g. zero-mapped samples)
 
-Ideal as a foundation for:
+Designed to be:
 
-GTF-based workflows
+Extended with DESeq2 / edgeR
 
-Salmon / STAR integration
+Modularized into modules/
 
-Multi-omics pipelines
+Integrated into larger multi-omics workflows
+
+
 
